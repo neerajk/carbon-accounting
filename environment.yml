@@ -1,0 +1,37 @@
+name: chmv2_v2
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - pillow
+  - pyyaml
+  - tqdm
+  # Geospatial stack
+  - rasterio
+  - xarray
+  - dask
+  - zarr
+  - fsspec
+  - pyproj
+  - affine
+  # For torchgeo dependencies
+  - rasterio
+  - pip:
+    # PyTorch with MPS support (macOS)
+    - torch
+    - torchvision
+    - transformers
+    - huggingface-hub
+    - torchgeo
+    - rioxarray
+    # STAC / Planetary Computer
+    - pystac-client
+    - planetary-computer
+    - stackstac
+    - odc-stac

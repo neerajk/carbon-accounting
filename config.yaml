@@ -1,0 +1,78 @@
+# ============================================================
+# CHMv2 Carbon Accounting Platform — Configuration
+# Uttarakhand State-Scale Canopy Height & Carbon Estimation
+# ============================================================
+
+# ----- Region Settings -----
+region: "dehradun"           # Options: dehradun, mussoorie
+resolution: 2.0              # Output resolution in meters (2m matches CHMv2)
+
+# ----- Model Configuration -----
+model:
+  hf_model_id: "facebook/dinov3-vitl16-chmv2-dpt-head"
+  device: "mps"               # Use "mps" for Apple Silicon, "cuda" for NVIDIA, "cpu" fallback
+  dtype: "float32"            # float32 recommended for stability
+  batch_size: 4               # Process 4 patches at once
+
+# ----- DataCube Settings -----
+datacube:
+  store_path: "data/zarr_store"
+  chunk_size: 512             # Matches DINOv3 input patch size
+  crs: "EPSG:3857"            # Web Mercator for ESRI tiles
+
+# ----- Tiling Configuration -----
+tiling:
+  patch_size: 512             # Input patch size
+  overlap: 64                 # Overlap for mosaicing
+  blend_mode: "linear"        # Feathered blending
+
+# ----- Stream Loader -----
+stream:
+  zoom: 18                    # ESRI tile zoom (18 ~ 0.6m native)
+  esri_url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+  dem_source: "synthetic"     # Options: synthetic, local (path below)
+
+dem_path: null                # Path to local DEM GeoTIFF (if available)
+
+# ----- Carbon Accounting -----
+carbon:
+  carbon_fraction: 0.47       # IPCC default (MgC per Mg biomass)
+  hotspot_threshold: 50.0     # MgC/ha threshold for Phase B ITC detection
+
+# ----- Allometry Parameters -----
+allometry:
+  params_file: "data/allometry_params.csv"
+  # Regional coefficients for Uttarakhand:
+  # Sal_Forest:  a=0.396, b=1.089, ρ=0.82
+  # Chir_Pine:   a=0.307, b=1.138, ρ=0.49
+  # Oak_Banj:    a=0.235, b=1.246, ρ=0.72
+
+# ----- Altitude Classification -----
+altitude_zones:
+  - name: "Sal_Forest"
+    min_alt: 0
+    max_alt: 1000
+    class_code: 1
+    wood_density: 0.82
+  - name: "Chir_Pine"
+    min_alt: 1000
+    max_alt: 1800
+    class_code: 2
+    wood_density: 0.49
+  - name: "Oak_Banj"
+    min_alt: 1800
+    max_alt: 2800
+    class_code: 3
+    wood_density: 0.72
+
+# ----- Output Settings -----
+output:
+  output_dir: "data/zarr_store"
+  save_visualizations: true
+  colormap: "viridis"
+  embedding_colormap: "turbo"
+
+# ----- Logging -----
+logging:
+  verbose: true
+  progress_bar: true
