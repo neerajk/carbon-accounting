@@ -12,6 +12,7 @@ dependencies:
   - pillow
   - pyyaml
   - tqdm
+  - zarr
   # Geospatial stack
   - rasterio
   - xarray

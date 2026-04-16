@@ -209,23 +209,33 @@ class CarbonInferenceEngine:
             # Process
             results = self.process_chunk(rgb_tile, dem_tile)
 
-            # Write to DataCube
-            ds["red"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 0]
-            ds["green"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 1]
-            ds["blue"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 2]
-            ds["dem"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = dem_tile
-            ds["chm"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["chm"]
-            ds["forest_class"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["forest_class"]
-            ds["carbon_density"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["carbon_density"]
-            ds["agb"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["agb"]
+            # --- THE FIX: Check target view shape before assignment to prevent crashing on edge fragments ---
+            target_view = ds["red"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512]
+            
+            # Ensure both the available dataset space and the fetched tile are a perfect 512x512 fit
+            if target_view.shape == (512, 512) and rgb_tile.shape[:2] == (512, 512):
+                ds["red"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 0]
+                ds["green"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 1]
+                ds["blue"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 2]
+                ds["dem"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = dem_tile
+                ds["chm"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["chm"]
+                ds["forest_class"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["forest_class"]
+                ds["carbon_density"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["carbon_density"]
+                ds["agb"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["agb"]
+            else:
+                # Option 1: Skip and warn
+                print(f"\n⚠️ Skipping edge fragment at row {row}, col {col} (Target Shape: {target_view.shape}, Tile Shape: {rgb_tile.shape[:2]})")
+                pass
 
             # Periodic save
+            # Periodic save
             if (idx + 1) % 10 == 0:
-                ds.to_zarr(self.cfg["output"]["output_dir"], mode="a")
+                ds.to_zarr(self.cfg["output"]["output_dir"], mode="a", consolidated=False)
                 print(f"[Phase A] Saved checkpoint after {idx + 1} chunks")
 
         # Final save
-        ds.to_zarr(self.cfg["output"]["output_dir"], mode="a")
+        # Final save
+        ds.to_zarr(self.cfg["output"]["output_dir"], mode="a", consolidated=False)
         print("[Phase A] Complete. Data saved to Zarr store.")
 
         return ds

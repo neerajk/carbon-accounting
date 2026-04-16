@@ -41,7 +41,7 @@ carbon:
 
 # ----- Allometry Parameters -----
 allometry:
-  params_file: "data/allometry_params.csv"
+  params_file: "config/allometry_params.csv"
   # Regional coefficients for Uttarakhand:
   # Sal_Forest:  a=0.396, b=1.089, ρ=0.82
   # Chir_Pine:   a=0.307, b=1.138, ρ=0.49

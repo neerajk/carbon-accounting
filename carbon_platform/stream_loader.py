@@ -12,37 +12,19 @@ import numpy as np
 import requests
 from PIL import Image
 from io import BytesIO
-import rasterio
-from rasterio.warp import reproject, Resampling, calculate_default_transform
-from rasterio.transform import from_bounds
 from pyproj import Transformer
-import warnings
-
-# Planetary Computer imports
-try:
-    import pystac_client
-    import planetary_computer
-    import stackstac
-    PC_AVAILABLE = True
-except ImportError:
-    PC_AVAILABLE = False
-    warnings.warn("Planetary Computer libraries not available. Using synthetic DEM.")
-
+from rasterio.transform import from_bounds
 
 # ESRI World Imagery tile server
 ESRI_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 
-# Planetary Computer STAC API
-STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
-COP_DEM_COLLECTION = "cop-dem-glo-30"
-
 
 class StreamLoader:
     """
-    Stream ESRI tiles and COP DEM GLO-30 on-the-fly.
+    Stream ESRI World Imagery tiles on-the-fly.
 
     - ESRI World Imagery: Zoom 18 (~0.6m native) → resampled to target resolution
-    - Planetary Computer DEM: 30m native → resampled to match RGB grid (512x512)
+    - DEM: Synthetic elevation model (Dehradun-Mussoorie region)
     """
 
     def __init__(
@@ -64,13 +46,13 @@ class StreamLoader:
         resolution : float
             Target resolution in meters (default 2m for CHMv2)
         use_real_data : bool
-            If True, fetch real ESRI tiles and Planetary Computer DEM.
-            If False, use synthetic data.
+            If True, fetch real ESRI tiles + synthetic DEM.
+            If False, use fully synthetic data.
         """
         self.bounds_3857 = bounds_3857
         self.zoom = zoom
         self.resolution = resolution
-        self.use_real_data = use_real_data and PC_AVAILABLE
+        self.use_real_data = use_real_data
         self.chunk_size = 512
 
         # Transformers
@@ -80,55 +62,6 @@ class StreamLoader:
         self.transformer_4326_to_3857 = Transformer.from_crs(
             "EPSG:4326", "EPSG:3857", always_xy=True
         )
-
-        # Initialize Planetary Computer client
-        self.pc_catalog = None
-        if self.use_real_data and PC_AVAILABLE:
-            try:
-                self.pc_catalog = pystac_client.Client.open(
-                    STAC_API,
-                    modifier=planetary_computer.sign_inplace,
-                )
-                print("[StreamLoader] Connected to Planetary Computer STAC API")
-            except Exception as e:
-                print(f"[StreamLoader] Failed to connect to Planetary Computer: {e}")
-                self.use_real_data = False
-
-        # Pre-fetch DEM search (we'll reuse this)
-        self.dem_item = None
-        if self.use_real_data:
-            self._prefetch_dem()
-
-    def _prefetch_dem(self):
-        """Search for DEM coverage over the region."""
-        if not self.pc_catalog:
-            return
-
-        try:
-            # Convert bounds to WGS84 for STAC search
-            min_lon, min_lat = self.transformer_3857_to_4326.transform(
-                self.bounds_3857["min_x"], self.bounds_3857["min_y"]
-            )
-            max_lon, max_lat = self.transformer_3857_to_4326.transform(
-                self.bounds_3857["max_x"], self.bounds_3857["max_y"]
-            )
-
-            search = self.pc_catalog.search(
-                collections=[COP_DEM_COLLECTION],
-                bbox=[min_lon, min_lat, max_lon, max_lat],
-            )
-            items = list(search.items())
-
-            if items:
-                self.dem_item = items[0]  # Use first item that covers the area
-                print(f"[StreamLoader] Found DEM item: {self.dem_item.id}")
-            else:
-                print("[StreamLoader] No DEM coverage found, will use synthetic")
-                self.use_real_data = False
-
-        except Exception as e:
-            print(f"[StreamLoader] DEM prefetch failed: {e}")
-            self.use_real_data = False
 
     def _webmercator_to_tile(self, x: float, y: float, zoom: int) -> Tuple[int, int]:
         """Convert Web Mercator coordinates to tile coordinates."""
@@ -201,9 +134,8 @@ class StreamLoader:
 
         if self.use_real_data:
             rgb = self._fetch_esri_for_bounds(min_x, min_y, max_x, max_y)
-            dem = self._fetch_dem_for_bounds(min_x, min_y, max_x, max_y)
+            dem = self._generate_synthetic_dem((min_x, min_y, max_x, max_y))
         else:
-            # Synthetic data
             dem = self._generate_synthetic_dem((min_x, min_y, max_x, max_y))
             rgb = self._generate_synthetic_rgb(dem)
 
@@ -297,54 +229,6 @@ class StreamLoader:
                 output[py_start:py_end, px_start:px_end] = tile_resized
 
         return output
-
-    def _fetch_dem_for_bounds(
-        self, min_x: float, min_y: float, max_x: float, max_y: float
-    ) -> np.ndarray:
-        """
-        Fetch COP DEM GLO-30 from Planetary Computer and resample to 512x512.
-        """
-        if not self.dem_item or not PC_AVAILABLE:
-            return self._generate_synthetic_dem((min_x, min_y, max_x, max_y))
-
-        try:
-            # Convert bounds to WGS84 for STAC
-            min_lon, min_lat = self.transformer_3857_to_4326.transform(min_x, min_y)
-            max_lon, max_lat = self.transformer_3857_to_4326.transform(max_x, max_y)
-            bbox = [min_lon, min_lat, max_lon, max_lat]
-
-            # Load DEM data using stackstac
-            dem_stack = stackstac.stack(
-                [self.dem_item],
-                assets=["data"],
-                bounds=bbox,
-                epsg=3857,
-                resolution=self.resolution,
-                dtype="float32",
-            )
-
-            # Compute (this triggers the actual read)
-            dem_data = dem_stack.compute()
-
-            if dem_data.size == 0:
-                raise ValueError("DEM data empty")
-
-            # Extract array and resample to 512x512
-            dem_arr = dem_data.values[0, 0]  # First time, first band
-
-            # Resize to 512x512 if needed
-            if dem_arr.shape != (self.chunk_size, self.chunk_size):
-                dem_arr = np.array(
-                    Image.fromarray(dem_arr).resize(
-                        (self.chunk_size, self.chunk_size), Image.BILINEAR
-                    )
-                )
-
-            return dem_arr.astype(np.float32)
-
-        except Exception as e:
-            print(f"[StreamLoader] DEM fetch failed: {e}, using synthetic")
-            return self._generate_synthetic_dem((min_x, min_y, max_x, max_y))
 
     def _generate_synthetic_dem(
         self, bounds_3857: Tuple[float, float, float, float]

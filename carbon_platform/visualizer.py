@@ -46,7 +46,7 @@ class CarbonVisualizer:
     - Data analysis charts
     """
 
-    def __init__(self, output_dir: str = "data/output"):
+    def __init__(self, output_dir: str = "outputs/visualizations"):
         """
         Initialize visualizer.
 

@@ -13,10 +13,14 @@ Author: Lead Geospatial AI Engineer
 """
 
 from __future__ import annotations
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import argparse
 import yaml
 from pathlib import Path
 import sys
+import torch
+from dask.distributed import Client, LocalCluster
 
 # Add pipeline to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -104,11 +108,20 @@ def main():
     cfg = load_config(args.config)
     cfg["region"] = args.region
 
-    # Paths
-    data_dir = Path(cfg["output"]["output_dir"])
-    data_dir.mkdir(parents=True, exist_ok=True)
-    allometry_path = data_dir / "allometry_params.csv"
-    viz_dir = data_dir / "visualizations"
+    # Paths - separate Zarr store from outputs
+    zarr_dir = Path(cfg["output"]["output_dir"])
+    zarr_dir.mkdir(parents=True, exist_ok=True)
+
+    # Non-Zarr outputs go to separate directory
+    project_root = Path(__file__).parent
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs_dir = project_root / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    allometry_path = config_dir / "allometry_params.csv"
+    viz_dir = outputs_dir / "visualizations"
 
     print("=" * 70)
     print("  CHMv2 Carbon Accounting Platform")
@@ -120,98 +133,115 @@ def main():
     print("=" * 70)
     print()
 
-    # Initialize DataCube
-    print("[Setup] Initializing DataCube...")
-    datacube = DataCubeManager(
-        store_path=str(data_dir),
-        region=args.region,
-        resolution=cfg.get("resolution", 2.0),
+    # --- DASK MULTI-PROCESSING SETUP ---
+    # 1. Prevent PyTorch from fighting Dask for threads
+    torch.set_num_threads(1)
+    
+    # 2. Spin up the LocalCluster (This replaces the port-hanging background processes)
+    print("[Setup] Initializing Dask Multi-Processing Cluster...")
+    cluster = LocalCluster(
+        n_workers=4,          # Adjust based on your Mac's RAM (4 is safe for 16GB-32GB)
+        threads_per_worker=1, # Crucial: forces multi-processing over multi-threading
+        processes=True,       
+        dashboard_address=':8787'
     )
+    
+    # 3. Wrap execution in the Client context to guarantee clean teardown
+    with Client(cluster) as client:
+        print(f"🚀 Dask Dashboard live at: {client.dashboard_link}\n")
 
-    # Visualization-only mode
-    if args.visualize_only:
-        print("[Visualize] Loading existing DataCube...")
-        ds = datacube.open_store()
+        # Initialize DataCube
+        print("[Setup] Initializing DataCube...")
+        datacube = DataCubeManager(
+            store_path=str(zarr_dir),
+            region=args.region,
+            resolution=cfg.get("resolution", 2.0),
+        )
 
-        # Run comprehensive visualization
+        # Visualization-only mode
+        if args.visualize_only:
+            print("[Visualize] Loading existing DataCube...")
+            ds = datacube.open_store()
+
+            # Run comprehensive visualization
+            run_comprehensive_visualization(ds, viz_dir, cfg, args)
+            return
+
+        # Initialize or open DataCube
+        try:
+            ds = datacube.open_store()
+            print(f"[Setup] Opened existing DataCube: {zarr_dir / f'{args.region}_carbon.zarr'}")
+        except FileNotFoundError:
+            print("[Setup] Creating new DataCube...")
+            ds = datacube.initialize_store(chunk_size=512)
+
+        if args.init_only:
+            print("\n[Complete] DataCube initialized. Ready for inference.")
+            print(f"  Store: {zarr_dir / f'{args.region}_carbon.zarr'}")
+            print(f"  Dimensions: {datacube.height_px} x {datacube.width_px} pixels")
+            return
+
+        # Initialize inference engine
+        print("[Setup] Loading inference engine...")
+        engine = CarbonInferenceEngine(cfg, str(allometry_path))
+
+        # Initialize stream loader
+        print("[Setup] Initializing stream loader...")
+        stream_loader = StreamLoader(
+            bounds_3857=datacube.bounds_3857,
+            zoom=cfg.get("zoom", 18),
+            resolution=cfg.get("resolution", 2.0),
+            use_real_data=cfg.get("use_real_data", True),
+        )
+
+        total_tiles = stream_loader.estimate_total_tiles()
+        print(f"[Setup] Estimated tiles to process: {total_tiles}")
+
+        # Phase A: Full district ABA processing
+        if args.phase in ["a", "all"]:
+            print("\n" + "=" * 70)
+            print("  PHASE A: Area-Based Approach (ABA)")
+            print("  Full-district pixel-wise canopy height & carbon estimation")
+            print("=" * 70)
+
+            ds = engine.run_phase_a(ds, stream_loader)
+
+            # Get statistics
+            print("\n[Analysis] Calculating forest statistics...")
+            dem_classifier = DEMClassifier()
+            stats = dem_classifier.get_zone_statistics(ds["dem"].values)
+
+            print("\nForest Zone Statistics:")
+            for forest_name, info in stats.items():
+                if info["area_ha"] > 0:
+                    print(f"  {forest_name}: {info['area_ha']:.1f} ha")
+
+        # Phase B: ITC hotspot detection
+        if args.phase in ["b", "all"]:
+            print("\n" + "=" * 70)
+            print("  PHASE B: Individual Tree Crown (ITC) Detection")
+            print(f"  High-carbon hotspot detection (>{args.carbon_threshold} MgC/ha)")
+            print("=" * 70)
+
+            phase_b_results = engine.run_phase_b(ds, carbon_threshold=args.carbon_threshold)
+
+            print(f"\n[Phase B] Hotspots detected: {phase_b_results['hotspot_count']}")
+            print(f"[Phase B] Total carbon in hotspots: {phase_b_results['total_carbon_in_hotspots']:.1f} MgC")
+
+        # Visualization
+        print("\n" + "=" * 70)
+        print("  GENERATING VISUALIZATIONS")
+        print("=" * 70)
+
         run_comprehensive_visualization(ds, viz_dir, cfg, args)
-        return
 
-    # Initialize or open DataCube
-    try:
-        ds = datacube.open_store()
-        print(f"[Setup] Opened existing DataCube: {data_dir / f'{args.region}_carbon.zarr'}")
-    except FileNotFoundError:
-        print("[Setup] Creating new DataCube...")
-        ds = datacube.initialize_store(chunk_size=512)
-
-    if args.init_only:
-        print("\n[Complete] DataCube initialized. Ready for inference.")
-        print(f"  Store: {data_dir / f'{args.region}_carbon.zarr'}")
-        print(f"  Dimensions: {datacube.height_px} x {datacube.width_px} pixels")
-        return
-
-    # Initialize inference engine
-    print("[Setup] Loading inference engine...")
-    engine = CarbonInferenceEngine(cfg, str(allometry_path))
-
-    # Initialize stream loader
-    print("[Setup] Initializing stream loader...")
-    stream_loader = StreamLoader(
-        bounds_3857=datacube.bounds_3857,
-        zoom=cfg.get("zoom", 18),
-        resolution=cfg.get("resolution", 2.0),
-        use_real_data=cfg.get("use_real_data", True),
-    )
-
-    total_tiles = stream_loader.estimate_total_tiles()
-    print(f"[Setup] Estimated tiles to process: {total_tiles}")
-
-    # Phase A: Full district ABA processing
-    if args.phase in ["a", "all"]:
         print("\n" + "=" * 70)
-        print("  PHASE A: Area-Based Approach (ABA)")
-        print("  Full-district pixel-wise canopy height & carbon estimation")
+        print("  CARBON ACCOUNTING COMPLETE")
         print("=" * 70)
-
-        ds = engine.run_phase_a(ds, stream_loader)
-
-        # Get statistics
-        print("\n[Analysis] Calculating forest statistics...")
-        dem_classifier = DEMClassifier()
-        stats = dem_classifier.get_zone_statistics(ds["dem"].values)
-
-        print("\nForest Zone Statistics:")
-        for forest_name, info in stats.items():
-            if info["area_ha"] > 0:
-                print(f"  {forest_name}: {info['area_ha']:.1f} ha")
-
-    # Phase B: ITC hotspot detection
-    if args.phase in ["b", "all"]:
-        print("\n" + "=" * 70)
-        print("  PHASE B: Individual Tree Crown (ITC) Detection")
-        print(f"  High-carbon hotspot detection (>{args.carbon_threshold} MgC/ha)")
+        print(f"  DataCube: {zarr_dir / f'{args.region}_carbon.zarr'}")
+        print(f"  Visualizations: {viz_dir}")
+        print(f"  Reports: {outputs_dir}") # Fixed undefined variable
         print("=" * 70)
-
-        phase_b_results = engine.run_phase_b(ds, carbon_threshold=args.carbon_threshold)
-
-        print(f"\n[Phase B] Hotspots detected: {phase_b_results['hotspot_count']}")
-        print(f"[Phase B] Total carbon in hotspots: {phase_b_results['total_carbon_in_hotspots']:.1f} MgC")
-
-    # Visualization
-    print("\n" + "=" * 70)
-    print("  GENERATING VISUALIZATIONS")
-    print("=" * 70)
-
-    run_comprehensive_visualization(ds, viz_dir, cfg, args)
-
-    print("\n" + "=" * 70)
-    print("  CARBON ACCOUNTING COMPLETE")
-    print("=" * 70)
-    print(f"  DataCube: {data_dir / f'{args.region}_carbon.zarr'}")
-    print(f"  Visualizations: {viz_dir}")
-    print(f"  Reports: {data_dir}")
-    print("=" * 70)
 
 
 def run_comprehensive_visualization(ds, viz_dir, cfg, args):
@@ -229,6 +259,11 @@ def run_comprehensive_visualization(ds, viz_dir, cfg, args):
         {"name": "Oak_Banj", "min_alt": 1800, "max_alt": 2800, "class_code": 3, "wood_density": 0.72},
     ])
 
+    # Pre-extract full arrays so they are available for all sub-functions safely
+    print("\n[Visualize] Loading full arrays into memory...")
+    dem_full = ds.dem.values
+    forest_class_full = ds.forest_class.values
+
     # 1. Single Patch Visualization (first patch)
     if args.patch_viz or args.visualize_only:
         print("\n[Visualize] Generating single-patch analysis...")
@@ -245,15 +280,15 @@ def run_comprehensive_visualization(ds, viz_dir, cfg, args):
                     ds.blue[y:y+512, x:x+512].values,
                 ], axis=-1)
 
-                dem = ds.dem[y:y+512, x:x+512].values
-                chm = ds.chm[y:y+512, x:x+512].values
-                forest_class = ds.forest_class[y:y+512, x:x+512].values
-                carbon = ds.carbon_density[y:y+512, x:x+512].values
+                dem_patch = ds.dem[y:y+512, x:x+512].values
+                chm_patch = ds.chm[y:y+512, x:x+512].values
+                forest_class_patch = ds.forest_class[y:y+512, x:x+512].values
+                carbon_patch = ds.carbon_density[y:y+512, x:x+512].values
 
                 # Check if valid
-                if np.any(chm > 0):
+                if np.any(chm_patch > 0):
                     visualizer.visualize_single_patch(
-                        rgb, dem, chm, forest_class, carbon,
+                        rgb, dem_patch, chm_patch, forest_class_patch, carbon_patch,
                         patch_idx=i, save_path=str(viz_dir / f"patch_{i:04d}_full_analysis.png")
                     )
                     print(f"  Saved: patch_{i:04d}_full_analysis.png (6-panel)")
@@ -262,10 +297,6 @@ def run_comprehensive_visualization(ds, viz_dir, cfg, args):
     # 2. DEM Analysis
     if args.dem_analysis or args.visualize_only:
         print("\n[Visualize] Generating DEM analysis...")
-        dem_classifier = DEMClassifier()
-        dem_full = ds.dem.values
-        forest_class_full = ds.forest_class.values
-
         visualizer.create_dem_analysis(
             dem_full, forest_class_full, altitude_zones,
             save_path=str(viz_dir / "dem_analysis.png")
@@ -315,7 +346,7 @@ def run_comprehensive_visualization(ds, viz_dir, cfg, args):
     # Summary visualization
     print("\n[Visualize] Generating summary...")
     dem_classifier = DEMClassifier()
-    stats = dem_classifier.get_zone_statistics(ds["dem"].values)
+    stats = dem_classifier.get_zone_statistics(dem_full)
     visualizer.export_summary(ds, stats)
     print("  Saved: carbon_summary.png")
 
