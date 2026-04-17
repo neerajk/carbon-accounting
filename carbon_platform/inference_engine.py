@@ -196,6 +196,13 @@ class CarbonInferenceEngine:
 
         # Get chunks from stream loader
         chunk_indices = stream_loader.get_chunk_indices()
+
+        # Apply limit if specified
+        limit = self.cfg.get("limit")
+        if limit:
+            chunk_indices = chunk_indices[:limit]
+            print(f"[Phase A] Limit applied: processing first {limit} of {len(stream_loader.get_chunk_indices())} chunks")
+
         print(f"[Phase A] Total chunks to process: {len(chunk_indices)}")
 
         # Process each chunk

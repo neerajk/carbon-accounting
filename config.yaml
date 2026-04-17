@@ -72,6 +72,11 @@ output:
   colormap: "viridis"
   embedding_colormap: "turbo"
 
+# ----- Limit Settings -----
+# Process only N patches before exiting.  If omitted, runs to completion.
+# Example: limit: 500   # will process first 500 patches only
+limit: 100
+
 # ----- Logging -----
 logging:
   verbose: true

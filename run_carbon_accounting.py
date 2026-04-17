@@ -102,11 +102,19 @@ def main():
         default=50.0,
         help="Carbon threshold for Phase B hotspot detection (MgC/ha)",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit processing to N chunks (for testing)",
+    )
     args = parser.parse_args()
 
     # Load configuration
     cfg = load_config(args.config)
     cfg["region"] = args.region
+    if args.limit is not None:
+        cfg["limit"] = args.limit
 
     # Paths - separate Zarr store from outputs
     zarr_dir = Path(cfg["output"]["output_dir"])
@@ -130,6 +138,8 @@ def main():
     print(f"  Region: {args.region.upper()}")
     print(f"  Device: {cfg['model']['device']}")
     print(f"  Resolution: {cfg.get('resolution', 2.0)}m")
+    if cfg.get("limit"):
+        print(f"  Limit: {cfg['limit']} chunks (testing mode)")
     print("=" * 70)
     print()
 
@@ -216,17 +226,15 @@ def main():
                 if info["area_ha"] > 0:
                     print(f"  {forest_name}: {info['area_ha']:.1f} ha")
 
-        # Phase B: ITC hotspot detection
-        if args.phase in ["b", "all"]:
-            print("\n" + "=" * 70)
-            print("  PHASE B: Individual Tree Crown (ITC) Detection")
-            print(f"  High-carbon hotspot detection (>{args.carbon_threshold} MgC/ha)")
-            print("=" * 70)
-
-            phase_b_results = engine.run_phase_b(ds, carbon_threshold=args.carbon_threshold)
-
-            print(f"\n[Phase B] Hotspots detected: {phase_b_results['hotspot_count']}")
-            print(f"[Phase B] Total carbon in hotspots: {phase_b_results['total_carbon_in_hotspots']:.1f} MgC")
+        # Phase B: ITC hotspot detection (BYPASSED - placeholder only)
+        # if args.phase in ["b", "all"]:
+        #     print("\n" + "=" * 70)
+        #     print("  PHASE B: Individual Tree Crown (ITC) Detection")
+        #     print(f"  High-carbon hotspot detection (>{args.carbon_threshold} MgC/ha)")
+        #     print("=" * 70)
+        #     phase_b_results = engine.run_phase_b(ds, carbon_threshold=args.carbon_threshold)
+        #     print(f"\n[Phase B] Hotspots detected: {phase_b_results['hotspot_count']}")
+        #     print(f"[Phase B] Total carbon in hotspots: {phase_b_results['total_carbon_in_hotspots']:.1f} MgC")
 
         # Visualization
         print("\n" + "=" * 70)

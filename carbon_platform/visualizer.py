@@ -501,7 +501,12 @@ class CarbonVisualizer:
         base = self._forest_class_to_rgb(forest_class)
 
         # Overlay: carbon as heatmap
-        carbon_norm = np.clip(carbon / (np.percentile(carbon[carbon > 0], 99) + 1e-8), 0, 1)
+        positive_carbon = carbon[carbon > 0]
+        if positive_carbon.size > 0:
+            carbon_scale = np.percentile(positive_carbon, 99)
+        else:
+            carbon_scale = 1.0
+        carbon_norm = np.clip(carbon / (carbon_scale + 1e-8), 0, 1)
         heatmap = plt.cm.YlOrRd(carbon_norm)[:, :, :3]
 
         # Blend

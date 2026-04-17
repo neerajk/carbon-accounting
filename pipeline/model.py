@@ -5,7 +5,7 @@ Load CHMv2 model and processor from HuggingFace Hub.
 """
 
 import torch
-from transformers import CHMv2ForDepthEstimation, CHMv2ImageProcessorFast
+from transformers import CHMv2ForDepthEstimation, CHMv2ImageProcessor
 
 
 def load_model_and_processor(cfg: dict):
@@ -26,7 +26,7 @@ def load_model_and_processor(cfg: dict):
     dtype = torch.float32 if dtype_str == "float32" else torch.float16
 
     print(f"[model] Loading processor from  : {model_id}")
-    processor = CHMv2ImageProcessorFast.from_pretrained(model_id)
+    processor = CHMv2ImageProcessor.from_pretrained(model_id)
 
     print(f"[model] Loading model weights from: {model_id}")
     print(f"[model] Device={device}  dtype={dtype}")
