@@ -19,16 +19,20 @@ class CarbonDataAnalyzer:
     Analyze carbon accounting data for insights and trends.
     """
 
-    def __init__(self, ds: xr.Dataset):
+    def __init__(self, data_dict):
         """
-        Initialize analyzer with DataCube dataset.
+        Initialize analyzer with carbon accounting data.
 
         Parameters
         ----------
-        ds : xr.Dataset
-            DataCube with carbon variables
+        data_dict : dict
+            Dictionary with numpy arrays: 'dem', 'chm', 'carbon_density', 'forest_class', 'agb'
         """
-        self.ds = ds
+        self.dem = data_dict['dem']
+        self.chm = data_dict['chm']
+        self.carbon_density = data_dict['carbon_density']
+        self.forest_class = data_dict['forest_class']
+        self.agb = data_dict.get('agb')
         self.results = {}
 
     def run_full_analysis(self, altitude_zones: List[Dict]) -> Dict:
@@ -59,14 +63,14 @@ class CarbonDataAnalyzer:
 
     def _analyze_overview(self) -> Dict:
         """Generate overview statistics."""
-        dem = self.ds.dem.values
-        chm = self.ds.chm.values
-        carbon = self.ds.carbon_density.values
+        dem = self.dem
+        chm = self.chm
+        carbon = self.carbon_density
 
         overview = {
-            "total_pixels": int(self.ds.forest_class.size),
-            "valid_pixels": int(np.sum(self.ds.forest_class.values > 0)),
-            "coverage_percent": float(np.sum(self.ds.forest_class.values > 0) / self.ds.forest_class.size * 100),
+            "total_pixels": int(self.forest_class.size),
+            "valid_pixels": int(np.sum(self.forest_class > 0)),
+            "coverage_percent": float(np.sum(self.forest_class > 0) / self.forest_class.size * 100),
             "elevation_range": {
                 "min": float(np.min(dem[dem > 0])) if np.any(dem > 0) else 0,
                 "max": float(np.max(dem[dem > 0])) if np.any(dem > 0) else 0,
@@ -91,10 +95,10 @@ class CarbonDataAnalyzer:
 
     def _analyze_by_forest_type(self, altitude_zones: List[Dict]) -> Dict:
         """Analyze statistics by forest type."""
-        chm = self.ds.chm.values
-        carbon = self.ds.carbon_density.values
-        forest_class = self.ds.forest_class.values
-        dem = self.ds.dem.values
+        chm = self.chm
+        carbon = self.carbon_density
+        forest_class = self.forest_class
+        dem = self.dem
 
         results = {}
 
@@ -135,9 +139,9 @@ class CarbonDataAnalyzer:
 
     def _analyze_elevation_patterns(self) -> Dict:
         """Analyze patterns across elevation gradients."""
-        dem = self.ds.dem.values
-        chm = self.ds.chm.values
-        carbon = self.ds.carbon_density.values
+        dem = self.dem
+        chm = self.chm
+        carbon = self.carbon_density
 
         valid_mask = (dem > 0) & (chm > 0) & (carbon > 0)
 
@@ -177,8 +181,8 @@ class CarbonDataAnalyzer:
 
     def _identify_carbon_hotspots(self, threshold_percentile: float = 90.0) -> Dict:
         """Identify high-carbon hotspots."""
-        carbon = self.ds.carbon_density.values
-        forest_class = self.ds.forest_class.values
+        carbon = self.carbon_density
+        forest_class = self.forest_class
 
         valid_mask = carbon > 0
         if not np.any(valid_mask):
@@ -206,9 +210,9 @@ class CarbonDataAnalyzer:
 
     def _analyze_correlations(self) -> Dict:
         """Analyze correlations between variables."""
-        dem = self.ds.dem.values
-        chm = self.ds.chm.values
-        carbon = self.ds.carbon_density.values
+        dem = self.dem
+        chm = self.chm
+        carbon = self.carbon_density
 
         valid_mask = (dem > 0) & (chm > 0) & (carbon > 0)
 
@@ -237,8 +241,8 @@ class CarbonDataAnalyzer:
 
     def _calculate_carbon_stock(self, altitude_zones: List[Dict]) -> Dict:
         """Calculate total carbon stock."""
-        carbon = self.ds.carbon_density.values
-        forest_class = self.ds.forest_class.values
+        carbon = self.carbon_density
+        forest_class = self.forest_class
 
         valid_mask = carbon > 0
         pixel_area_ha = 4 / 10000  # 2m resolution

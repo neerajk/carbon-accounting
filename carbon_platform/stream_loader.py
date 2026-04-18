@@ -114,13 +114,29 @@ class StreamLoader:
 
     def fetch_chunk(
         self, row: int, col: int
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], rasterio.Affine]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """
         Fetch data for a specific 512x512 chunk.
 
         Returns
         -------
-        tuple: (rgb_array, dem_array, affine_transform)
+        tuple: (rgb_array, dem_array)
+        """
+        if self.use_real_data:
+            # Fetch real ESRI tiles
+            rgb = self._fetch_esri_chunk(row, col)
+            # Generate synthetic DEM (Planetary Computer fallback)
+            dem = self._generate_synthetic_dem_for_chunk(row, col)
+        else:
+            # Fully synthetic data for testing
+            dem = self._generate_synthetic_dem_for_chunk(row, col)
+            rgb = self._generate_synthetic_rgb(dem)
+
+        return rgb, dem
+
+    def _fetch_esri_chunk(self, row: int, col: int) -> np.ndarray:
+        """
+        Fetch ESRI tiles for a specific chunk and mosaic to 512x512.
         """
         # Calculate chunk bounds in Web Mercator
         chunk_size_m = self.chunk_size * self.resolution
@@ -129,25 +145,7 @@ class StreamLoader:
         min_y = self.bounds_3857["min_y"] + row * chunk_size_m
         max_y = min(min_y + chunk_size_m, self.bounds_3857["max_y"])
 
-        # Create affine transform for this chunk
-        transform = from_bounds(min_x, min_y, max_x, max_y, self.chunk_size, self.chunk_size)
-
-        if self.use_real_data:
-            rgb = self._fetch_esri_for_bounds(min_x, min_y, max_x, max_y)
-            dem = self._generate_synthetic_dem((min_x, min_y, max_x, max_y))
-        else:
-            dem = self._generate_synthetic_dem((min_x, min_y, max_x, max_y))
-            rgb = self._generate_synthetic_rgb(dem)
-
-        return rgb, dem, transform
-
-    def _fetch_esri_for_bounds(
-        self, min_x: float, min_y: float, max_x: float, max_y: float
-    ) -> np.ndarray:
-        """
-        Fetch and mosaic ESRI tiles to cover the given bounds.
-        """
-        # Find tile range
+        # Find tile range at zoom level
         x_min_tile, y_max_tile = self._webmercator_to_tile(min_x, max_y, self.zoom)
         x_max_tile, y_min_tile = self._webmercator_to_tile(max_x, min_y, self.zoom)
 
@@ -164,12 +162,11 @@ class StreamLoader:
 
         if not tiles_rgb:
             # Fallback to synthetic
-            return self._generate_synthetic_rgb(
-                self._generate_synthetic_dem((min_x, min_y, max_x, max_y))
-            )
+            dem_fallback = self._generate_synthetic_dem_for_chunk(row, col)
+            return self._generate_synthetic_rgb(dem_fallback)
 
-        # Mosaic tiles into single image at target resolution
-        return self._mosaic_tiles(tiles_rgb, tile_bounds, min_x, min_y, max_x, max_y)
+        # Mosaic tiles into single 512x512 image
+        return self._mosaic_tiles_to_512(tiles_rgb, tile_bounds, min_x, min_y, max_x, max_y)
 
     def _fetch_esri_tile(self, x: int, y: int, z: int) -> Optional[np.ndarray]:
         """Fetch single ESRI tile (256x256)."""
@@ -183,7 +180,7 @@ class StreamLoader:
             print(f"[StreamLoader] ESRI tile failed {x},{y},{z}: {e}")
         return None
 
-    def _mosaic_tiles(
+    def _mosaic_tiles_to_512(
         self,
         tiles: List[np.ndarray],
         bounds: List[Tuple],
@@ -192,64 +189,52 @@ class StreamLoader:
         max_x: float,
         max_y: float,
     ) -> np.ndarray:
-        """Mosaic multiple tiles into target extent at 512x512."""
-        # Create output canvas
+        """Mosaic multiple tiles into target 512x512 extent."""
         output = np.zeros((self.chunk_size, self.chunk_size, 3), dtype=np.uint8)
-
-        # Calculate pixel scale
         width_m = max_x - min_x
         height_m = max_y - min_y
         x_scale = self.chunk_size / width_m
         y_scale = self.chunk_size / height_m
 
         for tile_img, tile_bounds in zip(tiles, bounds):
-            # Calculate pixel overlap
             t_min_x, t_min_y, t_max_x, t_max_y = tile_bounds
-
-            # Relative coordinates
             rel_x_start = (t_min_x - min_x) * x_scale
             rel_x_end = (t_max_x - min_x) * x_scale
-            rel_y_start = (max_y - t_max_y) * y_scale  # Flip Y
+            rel_y_start = (max_y - t_max_y) * y_scale
             rel_y_end = (max_y - t_min_y) * y_scale
-
-            # Convert to pixel coords
             px_start = max(0, int(rel_x_start))
             px_end = min(self.chunk_size, int(rel_x_end))
             py_start = max(0, int(rel_y_start))
             py_end = min(self.chunk_size, int(rel_y_end))
 
             if px_end > px_start and py_end > py_start:
-                # Resize tile to fit
                 tile_h = py_end - py_start
                 tile_w = px_end - px_start
                 tile_resized = np.array(
                     Image.fromarray(tile_img).resize((tile_w, tile_h), Image.BILINEAR)
                 )
-
                 output[py_start:py_end, px_start:px_end] = tile_resized
 
         return output
 
-    def _generate_synthetic_dem(
-        self, bounds_3857: Tuple[float, float, float, float]
-    ) -> np.ndarray:
-        """Generate synthetic elevation data for Dehradun-Mussoorie."""
-        min_x, min_y, max_x, max_y = bounds_3857
-
-        center_x = (min_x + max_x) / 2
-        center_y = (min_y + max_y) / 2
+    def _generate_synthetic_dem_for_chunk(self, row: int, col: int) -> np.ndarray:
+        """Generate synthetic elevation for a specific chunk."""
+        # Calculate chunk center for elevation gradient
+        min_x = self.bounds_3857["min_x"] + col * self.chunk_size * self.resolution
+        min_y = self.bounds_3857["min_y"] + row * self.chunk_size * self.resolution
+        center_x = min_x + self.chunk_size * self.resolution / 2
+        center_y = min_y + self.chunk_size * self.resolution / 2
         lon, lat = self.transformer_3857_to_4326.transform(center_x, center_y)
 
-        # Rough altitude model
+        # Base elevation for Dehradun-Mussoorie region
         base_elev = 600 + (lat - 30.2) * 3000
-
         dem = np.full((self.chunk_size, self.chunk_size), base_elev, dtype=np.float32)
         y_gradient = np.linspace(0, 1, self.chunk_size)[:, None] * 200
         dem += y_gradient
         noise = np.random.normal(0, 50, (self.chunk_size, self.chunk_size))
         dem += noise
-
         return np.clip(dem, 400, 3500)
+
 
     def _generate_synthetic_rgb(self, dem: np.ndarray) -> np.ndarray:
         """Generate synthetic RGB based on elevation."""

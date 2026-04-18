@@ -4,6 +4,15 @@ CHMv2 Carbon Accounting Platform for Uttarakhand
 ================================================
 Entry point for state-scale carbon estimation using CHMv2 + DINOv3.
 
+CORRECT FLOW:
+1. Fetch ESRI + DEM data → keep patches paired
+2. Run CHMv2 model → Canopy Height Model (CHM)
+3. Use DEM on CHM output → classify forest type
+4. Visualize: RGB, DEM, CHM, Forest Class
+5. Use allometry_params.csv → calculate AGB from CHM + forest_class
+6. Calculate Carbon = 47% of AGB
+7. Save all to GeoTIFF + unified visualization (single PNG with all steps)
+
 Usage:
     python run_carbon_accounting.py --region dehradun --config config.yaml
     python run_carbon_accounting.py --region mussoorie --visualize-only
@@ -20,17 +29,18 @@ import yaml
 from pathlib import Path
 import sys
 import torch
+import numpy as np
 from dask.distributed import Client, LocalCluster
 
 # Add pipeline to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from carbon_platform.datacube import DataCubeManager
 from carbon_platform.inference_engine import CarbonInferenceEngine
 from carbon_platform.stream_loader import StreamLoader
 from carbon_platform.visualizer import CarbonVisualizer
 from carbon_platform.dem_classifier import DEMClassifier
 from carbon_platform.data_analysis import CarbonDataAnalyzer
+from carbon_platform.geotiff_manager import GeoTIFFManager
 
 
 def load_config(path: str) -> dict:
@@ -116,11 +126,7 @@ def main():
     if args.limit is not None:
         cfg["limit"] = args.limit
 
-    # Paths - separate Zarr store from outputs
-    zarr_dir = Path(cfg["output"]["output_dir"])
-    zarr_dir.mkdir(parents=True, exist_ok=True)
-
-    # Non-Zarr outputs go to separate directory
+    # Paths
     project_root = Path(__file__).parent
     config_dir = project_root / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -128,6 +134,7 @@ def main():
     outputs_dir = project_root / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
+    geotiff_dir = outputs_dir / "geotiffs"
     allometry_path = config_dir / "allometry_params.csv"
     viz_dir = outputs_dir / "visualizations"
 
@@ -144,51 +151,40 @@ def main():
     print()
 
     # --- DASK MULTI-PROCESSING SETUP ---
-    # 1. Prevent PyTorch from fighting Dask for threads
     torch.set_num_threads(1)
-    
-    # 2. Spin up the LocalCluster (This replaces the port-hanging background processes)
+
     print("[Setup] Initializing Dask Multi-Processing Cluster...")
     cluster = LocalCluster(
-        n_workers=4,          # Adjust based on your Mac's RAM (4 is safe for 16GB-32GB)
-        threads_per_worker=1, # Crucial: forces multi-processing over multi-threading
-        processes=True,       
+        n_workers=4,
+        threads_per_worker=1,
+        processes=True,
         dashboard_address=':8787'
     )
-    
-    # 3. Wrap execution in the Client context to guarantee clean teardown
-    with Client(cluster) as client:
-        print(f"🚀 Dask Dashboard live at: {client.dashboard_link}\n")
 
-        # Initialize DataCube
-        print("[Setup] Initializing DataCube...")
-        datacube = DataCubeManager(
-            store_path=str(zarr_dir),
+    with Client(cluster) as client:
+        print(f"Dask Dashboard: {client.dashboard_link}\n")
+
+        # Initialize GeoTIFF Manager
+        print("[Setup] Initializing GeoTIFF Manager...")
+        geotiff_manager = GeoTIFFManager(
+            output_dir=str(geotiff_dir),
             region=args.region,
             resolution=cfg.get("resolution", 2.0),
         )
 
+        geotiff_manager.initialize_geotiffs()
+
         # Visualization-only mode
         if args.visualize_only:
-            print("[Visualize] Loading existing DataCube...")
-            ds = datacube.open_store()
-
-            # Run comprehensive visualization
-            run_comprehensive_visualization(ds, viz_dir, cfg, args)
+            print("[Visualize] Loading existing GeoTIFF files...")
+            data_dict = geotiff_manager.load_all_layers()
+            run_comprehensive_visualization(data_dict, viz_dir, cfg, args, str(allometry_path))
             return
 
-        # Initialize or open DataCube
-        try:
-            ds = datacube.open_store()
-            print(f"[Setup] Opened existing DataCube: {zarr_dir / f'{args.region}_carbon.zarr'}")
-        except FileNotFoundError:
-            print("[Setup] Creating new DataCube...")
-            ds = datacube.initialize_store(chunk_size=512)
-
         if args.init_only:
-            print("\n[Complete] DataCube initialized. Ready for inference.")
-            print(f"  Store: {zarr_dir / f'{args.region}_carbon.zarr'}")
-            print(f"  Dimensions: {datacube.height_px} x {datacube.width_px} pixels")
+            print("\n[Complete] GeoTIFF files initialized. Ready for inference.")
+            print(f"  Store: {geotiff_dir}")
+            print(f"  Dimensions: {geotiff_manager.height_px} x {geotiff_manager.width_px} pixels")
             return
 
         # Initialize inference engine
@@ -198,7 +194,7 @@ def main():
         # Initialize stream loader
         print("[Setup] Initializing stream loader...")
         stream_loader = StreamLoader(
-            bounds_3857=datacube.bounds_3857,
+            bounds_3857=geotiff_manager.bounds_3857,
             zoom=cfg.get("zoom", 18),
             resolution=cfg.get("resolution", 2.0),
             use_real_data=cfg.get("use_real_data", True),
@@ -207,155 +203,181 @@ def main():
         total_tiles = stream_loader.estimate_total_tiles()
         print(f"[Setup] Estimated tiles to process: {total_tiles}")
 
-        # Phase A: Full district ABA processing
+        # ================================================================
+        # PHASE A: CORRECT FLOW
+        # ================================================================
         if args.phase in ["a", "all"]:
             print("\n" + "=" * 70)
             print("  PHASE A: Area-Based Approach (ABA)")
-            print("  Full-district pixel-wise canopy height & carbon estimation")
+            print("  Flow:")
+            print("    1. Fetch ESRI + DEM → keep patches paired")
+            print("    2. Run CHMv2 model → Canopy Height")
+            print("    3. Use DEM on CHM output → classify forest")
+            print("    4. Use allometry_params.csv → calculate AGB")
+            print("    5. Calculate Carbon = 47% of AGB")
+            print("    6. Save GeoTIFF + unified visualization (single PNG)")
             print("=" * 70)
 
-            ds = engine.run_phase_a(ds, stream_loader)
+            # Run Phase A - returns first chunk for visualization
+            first_chunk_data = engine.run_phase_a(geotiff_manager, stream_loader)
+
+            # Generate unified visualization (ALL STEPS IN ONE PNG)
+            if first_chunk_data and first_chunk_data.get("chm") is not None:
+                print("\n[Visualize] Generating unified flow visualization...")
+                print("  This single PNG shows all steps:")
+                print("    - RGB Imagery (ESRI input)")
+                print("    - DEM Elevation (input)")
+                print("    - Canopy Height (CHMv2 output)")
+                print("    - Forest Classification (DEM-based)")
+                print("    - Above-Ground Biomass (allometry)")
+                print("    - Carbon Density (47% of AGB)")
+                print("    - DEM vs CHM scatter")
+                print("    - Statistics summary")
+
+                visualizer = CarbonVisualizer(
+                    str(viz_dir),
+                    allometry_path=str(allometry_path),
+                    carbon_fraction=0.47
+                )
+
+                rgb_stack = np.stack([
+                    first_chunk_data["red"],
+                    first_chunk_data["green"],
+                    first_chunk_data["blue"]
+                ], axis=-1)
+
+                visualizer.visualize_single_patch(
+                    rgb=rgb_stack,
+                    dem=first_chunk_data["dem"],
+                    chm=first_chunk_data["chm"],
+                    forest_class=first_chunk_data["forest_class"],
+                    carbon_density=first_chunk_data["carbon_density"],
+                    agb=first_chunk_data["agb"],
+                    patch_idx=0,
+                    save_path=str(viz_dir / "complete_flow_visualization.png")
+                )
+                print("\n  SAVED: complete_flow_visualization.png (8-panel unified)")
 
             # Get statistics
             print("\n[Analysis] Calculating forest statistics...")
+            data_dict = geotiff_manager.load_all_layers()
             dem_classifier = DEMClassifier()
-            stats = dem_classifier.get_zone_statistics(ds["dem"].values)
+            stats = dem_classifier.get_zone_statistics(data_dict["dem"])
 
             print("\nForest Zone Statistics:")
             for forest_name, info in stats.items():
                 if info["area_ha"] > 0:
                     print(f"  {forest_name}: {info['area_ha']:.1f} ha")
 
-        # Phase B: ITC hotspot detection (BYPASSED - placeholder only)
-        # if args.phase in ["b", "all"]:
-        #     print("\n" + "=" * 70)
-        #     print("  PHASE B: Individual Tree Crown (ITC) Detection")
-        #     print(f"  High-carbon hotspot detection (>{args.carbon_threshold} MgC/ha)")
-        #     print("=" * 70)
-        #     phase_b_results = engine.run_phase_b(ds, carbon_threshold=args.carbon_threshold)
-        #     print(f"\n[Phase B] Hotspots detected: {phase_b_results['hotspot_count']}")
-        #     print(f"[Phase B] Total carbon in hotspots: {phase_b_results['total_carbon_in_hotspots']:.1f} MgC")
-
-        # Visualization
+        # ================================================================
+        # ADDITIONAL VISUALIZATIONS (on request)
+        # ================================================================
         print("\n" + "=" * 70)
-        print("  GENERATING VISUALIZATIONS")
+        print("  GENERATING ADDITIONAL VISUALIZATIONS")
         print("=" * 70)
 
-        run_comprehensive_visualization(ds, viz_dir, cfg, args)
+        data_dict = geotiff_manager.load_all_layers()
+        run_comprehensive_visualization(data_dict, viz_dir, cfg, args, str(allometry_path))
 
         print("\n" + "=" * 70)
         print("  CARBON ACCOUNTING COMPLETE")
         print("=" * 70)
-        print(f"  DataCube: {zarr_dir / f'{args.region}_carbon.zarr'}")
+        print(f"  GeoTIFF Store: {geotiff_dir}")
         print(f"  Visualizations: {viz_dir}")
-        print(f"  Reports: {outputs_dir}") # Fixed undefined variable
+        print(f"  Reports: {outputs_dir}")
         print("=" * 70)
 
 
-def run_comprehensive_visualization(ds, viz_dir, cfg, args):
-    """Run comprehensive visualization suite."""
-    import numpy as np
+def run_comprehensive_visualization(data_dict, viz_dir, cfg, args, allometry_path: str | None = None):
+    """Run comprehensive visualization suite with unified flow visualization."""
     viz_dir = Path(viz_dir)
     viz_dir.mkdir(parents=True, exist_ok=True)
 
-    visualizer = CarbonVisualizer(str(viz_dir))
+    carbon_fraction = cfg.get("carbon", {}).get("carbon_fraction", 0.47)
+    visualizer = CarbonVisualizer(str(viz_dir), allometry_path=allometry_path, carbon_fraction=carbon_fraction)
 
-    # Get altitude zones from config
     altitude_zones = cfg.get("altitude_zones", [
         {"name": "Sal_Forest", "min_alt": 0, "max_alt": 1000, "class_code": 1, "wood_density": 0.82},
         {"name": "Chir_Pine", "min_alt": 1000, "max_alt": 1800, "class_code": 2, "wood_density": 0.49},
         {"name": "Oak_Banj", "min_alt": 1800, "max_alt": 2800, "class_code": 3, "wood_density": 0.72},
     ])
 
-    # Pre-extract full arrays so they are available for all sub-functions safely
     print("\n[Visualize] Loading full arrays into memory...")
-    dem_full = ds.dem.values
-    forest_class_full = ds.forest_class.values
+    dem_full = data_dict["dem"]
+    forest_class_full = data_dict["forest_class"]
+    chm_full = data_dict["chm"]
+    agb_full = data_dict.get("agb")
+    carbon_full = data_dict.get("carbon_density")
 
-    # 1. Single Patch Visualization (first patch)
-    if args.patch_viz or args.visualize_only:
-        print("\n[Visualize] Generating single-patch analysis...")
-        # Get first valid patch
-        h, w = ds.chm.shape
+    # Find first valid patch for unified visualization
+    h, w = chm_full.shape
 
-        # Find first valid 512x512 patch
-        for i in range(min(3, h // 512)):
-            y, x = i * 512, i * 512
-            if y + 512 <= h and x + 512 <= w:
-                rgb = np.stack([
-                    ds.red[y:y+512, x:x+512].values,
-                    ds.green[y:y+512, x:x+512].values,
-                    ds.blue[y:y+512, x:x+512].values,
-                ], axis=-1)
+    for i in range(min(3, h // 512)):
+        y, x = i * 512, i * 512
+        if y + 512 <= h and x + 512 <= w:
+            rgb_patch = np.stack([
+                data_dict["red"][y:y+512, x:x+512],
+                data_dict["green"][y:y+512, x:x+512],
+                data_dict["blue"][y:y+512, x:x+512],
+            ], axis=-1)
+            dem_patch = dem_full[y:y+512, x:x+512]
+            chm_patch = chm_full[y:y+512, x:x+512]
+            forest_patch = forest_class_full[y:y+512, x:x+512]
+            agb_patch = agb_full[y:y+512, x:x+512] if agb_full is not None else None
+            carbon_patch = carbon_full[y:y+512, x:x+512] if carbon_full is not None else None
 
-                dem_patch = ds.dem[y:y+512, x:x+512].values
-                chm_patch = ds.chm[y:y+512, x:x+512].values
-                forest_class_patch = ds.forest_class[y:y+512, x:x+512].values
-                carbon_patch = ds.carbon_density[y:y+512, x:x+512].values
+            if np.any(chm_patch > 0):
+                visualizer.visualize_single_patch(
+                    rgb_patch, dem_patch, chm_patch, forest_patch,
+                    carbon_patch, agb_patch,
+                    patch_idx=i,
+                    save_path=str(viz_dir / "complete_flow_visualization.png")
+                )
+                print(f"  Saved: complete_flow_visualization.png (8-panel unified)")
+                break
 
-                # Check if valid
-                if np.any(chm_patch > 0):
-                    visualizer.visualize_single_patch(
-                        rgb, dem_patch, chm_patch, forest_class_patch, carbon_patch,
-                        patch_idx=i, save_path=str(viz_dir / f"patch_{i:04d}_full_analysis.png")
-                    )
-                    print(f"  Saved: patch_{i:04d}_full_analysis.png (6-panel)")
-                    break
-
-    # 2. DEM Analysis
+    # Additional visualizations on request
     if args.dem_analysis or args.visualize_only:
         print("\n[Visualize] Generating DEM analysis...")
-        visualizer.create_dem_analysis(
-            dem_full, forest_class_full, altitude_zones,
-            save_path=str(viz_dir / "dem_analysis.png")
-        )
-        print("  Saved: dem_analysis.png (DEM + slope + aspect + histograms)")
+        visualizer.create_dem_analysis(dem_full, forest_class_full, altitude_zones,
+                                       save_path=str(viz_dir / "dem_analysis.png"))
+        print("  Saved: dem_analysis.png")
 
-    # 3. Forest Classification Map
     if args.forest_map or args.visualize_only:
         print("\n[Visualize] Generating forest classification map...")
-        visualizer.create_forest_classification_map(
-            forest_class_full, dem_full, altitude_zones,
-            save_path=str(viz_dir / "forest_classification_map.png")
-        )
+        visualizer.create_forest_classification_map(forest_class_full, dem_full, altitude_zones,
+                                                    save_path=str(viz_dir / "forest_classification_map.png"))
         print("  Saved: forest_classification_map.png")
 
-    # 4. Data Analysis Charts
     if args.data_charts or args.visualize_only:
         print("\n[Visualize] Generating data analysis charts...")
-        visualizer.create_data_analysis_charts(
-            ds, altitude_zones,
-            save_path=str(viz_dir / "data_analysis_charts.png")
-        )
-        print("  Saved: data_analysis_charts.png (10-panel analysis)")
+        visualizer.create_data_analysis_charts(data_dict, altitude_zones,
+                                               save_path=str(viz_dir / "data_analysis_charts.png"))
+        print("  Saved: data_analysis_charts.png")
 
-    # 5. Data Analysis and Reporting
     if args.export_report or args.visualize_only:
         print("\n[Analysis] Running data analysis...")
-        analyzer = CarbonDataAnalyzer(ds)
+        analyzer = CarbonDataAnalyzer(data_dict)
         results = analyzer.run_full_analysis(altitude_zones)
-
-        # Export reports
         analyzer.export_report(viz_dir / "analysis_report.txt")
         analyzer.export_csv(viz_dir / "analysis_results.csv")
         print("  Saved: analysis_report.txt")
         print("  Saved: analysis_results.csv")
 
-    # Always export sample slices
+    # Export sample slices
     print("\n[Visualize] Exporting sample slices...")
-    h, w = ds.chm.shape
     for i in range(min(3, h // 512)):
         y = i * 512
         x = i * 512
         if y + 512 <= h and x + 512 <= w:
-            visualizer.export_slice(ds, y, y + 512, x, x + 512, f"slice_{i:02d}.png")
+            visualizer.export_slice(data_dict, y, y + 512, x, x + 512, f"slice_{i:02d}.png")
             print(f"  Saved: slice_{i:02d}.png")
 
-    # Summary visualization
+    # Summary
     print("\n[Visualize] Generating summary...")
     dem_classifier = DEMClassifier()
     stats = dem_classifier.get_zone_statistics(dem_full)
-    visualizer.export_summary(ds, stats)
+    visualizer.export_summary(data_dict, stats)
     print("  Saved: carbon_summary.png")
 
 

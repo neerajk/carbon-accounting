@@ -40,8 +40,9 @@ def run_patch_inference(
     embeddings   : list of float32 (num_tokens, embed_dim) patch-level features
     """
     verbose = cfg["logging"].get("verbose", True)
-    show_bar = cfg["logging"].get("progress_bar", True)
-    
+    # Disable progress bar here - caller (run_phase_a) already has its own progress bar
+    show_bar = False
+
     # Grab batch size from config, default to 4 if not specified
     batch_size = cfg["model"].get("batch_size", 4)
 

@@ -46,7 +46,7 @@ class CarbonVisualizer:
     - Data analysis charts
     """
 
-    def __init__(self, output_dir: str = "outputs/visualizations"):
+    def __init__(self, output_dir: str = "outputs/visualizations", allometry_path: str | None = None, carbon_fraction: float = 0.47):
         """
         Initialize visualizer.
 
@@ -54,9 +54,71 @@ class CarbonVisualizer:
         ----------
         output_dir : str
             Directory for output PNGs
+        allometry_path : str or None
+            Path to allometry CSV file (optional). If provided, used to compute AGB/carbon when missing.
+        carbon_fraction : float
+            Fraction of biomass that is carbon (default 0.47)
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.carbon_fraction = carbon_fraction
+
+        # Load allometry params if provided
+        self.allometry_by_name = {}
+        self.allometry_by_code = {}
+        if allometry_path is not None:
+            try:
+                import csv as _csv
+                with open(allometry_path, newline='') as _f:
+                    reader = _csv.DictReader(_f)
+                    for row in reader:
+                        name = row.get('forest_type')
+                        if not name:
+                            continue
+                        # Normalize name to be robust to underscores vs spaces
+                        name_norm = name.replace("_", " ").strip()
+                        a = float(row.get('a', 0.0))
+                        b = float(row.get('b', 1.0))
+                        wd = float(row.get('wood_density', row.get('rho', 1.0)))
+                        self.allometry_by_name[name] = (a, b, wd)
+                        self.allometry_by_name[name_norm] = (a, b, wd)
+            except FileNotFoundError:
+                # Leave allometry empty if file not found
+                self.allometry_by_name = {}
+
+        # Map numeric class codes to allometry params when possible
+        for code, name in FOREST_NAMES.items():
+            if name in self.allometry_by_name:
+                self.allometry_by_code[code] = self.allometry_by_name[name]
+
+    @staticmethod
+    def _dict_to_xarray(data_dict: Dict[str, np.ndarray]) -> xr.Dataset:
+        """
+        Convert dict-based data to xarray Dataset for compatibility.
+        
+        Parameters
+        ----------
+        data_dict : Dict[str, np.ndarray]
+            Dictionary with keys like 'dem', 'chm', 'carbon_density', etc.
+            
+        Returns
+        -------
+        xr.Dataset
+            xarray Dataset with same data as input dict
+        """
+        # Create coordinates based on array shape
+        h, w = data_dict['dem'].shape
+        y = np.arange(h)
+        x = np.arange(w)
+        
+        # Create Dataset with each layer as a DataArray
+        data_vars = {}
+        for key, arr in data_dict.items():
+            if arr.ndim == 2 and arr.shape == (h, w):
+                data_vars[key] = (('y', 'x'), arr)
+        
+        ds = xr.Dataset(data_vars, coords={'y': y, 'x': x})
+        return ds
 
     def visualize_single_patch(
         self,
@@ -64,20 +126,23 @@ class CarbonVisualizer:
         dem: np.ndarray,
         chm: np.ndarray,
         forest_class: np.ndarray,
-        carbon_density: np.ndarray,
+        carbon_density: np.ndarray | None,
+        agb: np.ndarray | None = None,
         patch_idx: int = 0,
         save_path: Optional[str] = None,
     ) -> Path:
         """
-        Create comprehensive 6-panel visualization for a single patch.
+        Create comprehensive 8-panel visualization showing the complete flow.
 
-        Panels:
-        1. RGB imagery
-        2. DEM elevation
-        3. Forest classification (DEM-based)
-        4. Canopy Height (CHM)
-        5. Carbon density
-        6. Histogram analysis
+        Flow visualization:
+        1. RGB Imagery (ESRI satellite input)
+        2. DEM Elevation (input)
+        3. Canopy Height Model (CHMv2 model output)
+        4. Forest Classification (DEM-based zonation)
+        5. Above-Ground Biomass (allometry calculation)
+        6. Carbon Density (47% of AGB)
+        7. DEM vs CHM scatter
+        8. Statistics summary
 
         Parameters
         ----------
@@ -91,6 +156,8 @@ class CarbonVisualizer:
             Forest classification (H, W)
         carbon_density : np.ndarray
             Carbon density (H, W)
+        agb : np.ndarray, optional
+            Above-ground biomass (H, W)
         patch_idx : int
             Patch index for filename
         save_path : str, optional
@@ -101,78 +168,94 @@ class CarbonVisualizer:
         Path
             Path to saved PNG
         """
-        fig = plt.figure(figsize=(20, 12), dpi=150)
-        gs = fig.add_gridspec(2, 4, hspace=0.3, wspace=0.3)
+        fig = plt.figure(figsize=(24, 14), dpi=150)
+        gs = fig.add_gridspec(2, 4, hspace=0.25, wspace=0.25)
 
-        # Panel 1: RGB
+        # Panel 1: RGB Imagery (INPUT)
         ax1 = fig.add_subplot(gs[0, 0])
         ax1.imshow(np.clip(rgb, 0, 255).astype(np.uint8))
-        ax1.set_title(f"Patch {patch_idx:04d}: RGB Imagery", fontsize=11, fontweight="bold")
+        ax1.set_title("1. RGB Imagery (ESRI Satellite Input)", fontsize=11, fontweight="bold", color="#1f77b4")
         ax1.axis("off")
 
-        # Panel 2: DEM Elevation
+        # Panel 2: DEM Elevation (INPUT)
         ax2 = fig.add_subplot(gs[0, 1])
         dem_vmin, dem_vmax = dem.min(), dem.max()
         im2 = ax2.imshow(dem, cmap="terrain", vmin=dem_vmin, vmax=dem_vmax)
-        ax2.set_title("DEM Elevation (m)", fontsize=11, fontweight="bold")
+        ax2.set_title("2. DEM Elevation (Input)", fontsize=11, fontweight="bold", color="#1f77b4")
         ax2.axis("off")
         cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
         cbar2.set_label("Elevation (m)", fontsize=9)
-
-        # Add altitude zone lines
         self._add_altitude_lines(ax2, dem)
 
-        # Panel 3: Forest Classification
+        # Panel 3: Canopy Height Model (MODEL OUTPUT)
         ax3 = fig.add_subplot(gs[0, 2])
-        forest_rgb = self._forest_class_to_rgb(forest_class)
-        ax3.imshow(forest_rgb)
-        ax3.set_title("Forest Type (DEM-based)", fontsize=11, fontweight="bold")
-        ax3.axis("off")
-        self._add_forest_legend(ax3, loc="upper left")
-
-        # Panel 4: Canopy Height
-        ax4 = fig.add_subplot(gs[0, 3])
         chm_valid = chm[chm > 0]
         chm_vmax = np.percentile(chm_valid, 99) if len(chm_valid) > 0 else 40
-        im4 = ax4.imshow(chm, cmap="YlGn", vmin=0, vmax=chm_vmax)
-        ax4.set_title("Canopy Height (m)", fontsize=11, fontweight="bold")
+        im3 = ax3.imshow(chm, cmap="YlGn", vmin=0, vmax=chm_vmax)
+        ax3.set_title("3. Canopy Height (CHMv2 Model Output)", fontsize=11, fontweight="bold", color="#ff7f0e")
+        ax3.axis("off")
+        cbar3 = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        cbar3.set_label("Height (m)", fontsize=9)
+
+        # Panel 4: Forest Classification (DEM-BASED)
+        ax4 = fig.add_subplot(gs[0, 3])
+        forest_rgb = self._forest_class_to_rgb(forest_class)
+        ax4.imshow(forest_rgb)
+        ax4.set_title("4. Forest Classification (DEM-based Zonation)", fontsize=11, fontweight="bold", color="#2ca02c")
         ax4.axis("off")
-        cbar4 = plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
-        cbar4.set_label("Height (m)", fontsize=9)
+        self._add_forest_legend(ax4, loc="upper left")
 
-        # Panel 5: Carbon Density
+        # Panel 5: Above-Ground Biomass (ALLOMETRY)
         ax5 = fig.add_subplot(gs[1, 0])
-        carbon_valid = carbon_density[carbon_density > 0]
-        carbon_vmax = np.percentile(carbon_valid, 99) if len(carbon_valid) > 0 else 100
-        im5 = ax5.imshow(carbon_density, cmap="YlOrRd", vmin=0, vmax=carbon_vmax)
-        ax5.set_title("Carbon Density (MgC/ha)", fontsize=11, fontweight="bold")
-        ax5.axis("off")
-        cbar5 = plt.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
-        cbar5.set_label("MgC/ha", fontsize=9)
+        if agb is None:
+            ax5.text(0.5, 0.5, "AGB data unavailable", ha="center", va="center")
+            ax5.axis("off")
+        else:
+            agb_valid = agb[agb > 0]
+            agb_vmax = np.percentile(agb_valid, 99) if len(agb_valid) > 0 else 200
+            im5 = ax5.imshow(agb, cmap="YlOrBr", vmin=0, vmax=agb_vmax)
+            ax5.set_title("5. Above-Ground Biomass (Allometry: AGB from DBH)", fontsize=11, fontweight="bold", color="#d62728")
+            ax5.axis("off")
+            cbar5 = plt.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
+            cbar5.set_label("Mg/ha", fontsize=9)
 
-        # Panel 6: Combined overlay
+        # Panel 6: Carbon Density (47% OF AGB)
         ax6 = fig.add_subplot(gs[1, 1])
-        self._plot_combined_overlay(ax6, rgb, forest_class, carbon_density)
-        ax6.set_title("Carbon over Forest Types", fontsize=11, fontweight="bold")
-        ax6.axis("off")
+        if carbon_density is None:
+            ax6.text(0.5, 0.5, "Carbon data unavailable", ha="center", va="center")
+            ax6.axis("off")
+        else:
+            carbon_valid = carbon_density[carbon_density > 0]
+            carbon_vmax = np.percentile(carbon_valid, 99) if len(carbon_valid) > 0 else 100
+            im6 = ax6.imshow(carbon_density, cmap="YlOrRd", vmin=0, vmax=carbon_vmax)
+            ax6.set_title("6. Carbon Density (47% of AGB)", fontsize=11, fontweight="bold", color="#9467bd")
+            ax6.axis("off")
+            cbar6 = plt.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
+            cbar6.set_label("MgC/ha", fontsize=9)
 
         # Panel 7: DEM vs CHM scatter
         ax7 = fig.add_subplot(gs[1, 2])
         self._plot_elevation_height_scatter(ax7, dem, chm, forest_class)
 
-        # Panel 8: Statistics table
+        # Panel 8: Statistics summary
         ax8 = fig.add_subplot(gs[1, 3])
-        self._plot_statistics_table(ax8, dem, chm, forest_class, carbon_density)
+        self._plot_statistics_table(ax8, dem, chm, forest_class, carbon_density, agb)
 
         if save_path is None:
             save_path = self.output_dir / f"patch_{patch_idx:04d}_full_analysis.png"
         else:
             save_path = Path(save_path)
 
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        # Add main title explaining the flow
+        fig.suptitle(
+            "CHMv2 Carbon Accounting Flow: RGB+DEM → Canopy Height → Forest Classification → AGB (Allometry) → Carbon (47%)",
+            fontsize=14, fontweight="bold", y=0.98
+        )
+
+        fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor='white')
         plt.close(fig)
 
-        print(f"[Visualizer] Full patch analysis saved: {save_path}")
+        print(f"[Visualizer] Complete flow visualization saved: {save_path}")
         return save_path
 
     def create_dem_analysis(
@@ -310,7 +393,7 @@ class CarbonVisualizer:
 
     def create_data_analysis_charts(
         self,
-        ds: xr.Dataset,
+        data: any,  # Can be xr.Dataset or Dict[str, np.ndarray]
         altitude_zones: List[Dict],
         save_path: Optional[str] = None,
     ) -> Path:
@@ -319,8 +402,8 @@ class CarbonVisualizer:
 
         Parameters
         ----------
-        ds : xr.Dataset
-            DataCube dataset
+        data : xr.Dataset or Dict[str, np.ndarray]
+            Either an xarray Dataset or dict with 'dem', 'chm', 'carbon_density', 'forest_class'
         altitude_zones : list
             Zone definitions
         save_path : str, optional
@@ -331,6 +414,12 @@ class CarbonVisualizer:
         Path
             Path to saved PNG
         """
+        # Convert dict to xarray if needed
+        if isinstance(data, dict):
+            ds = self._dict_to_xarray(data)
+        else:
+            ds = data
+            
         fig = plt.figure(figsize=(20, 14), dpi=150)
         gs = fig.add_gridspec(3, 4, hspace=0.35, wspace=0.35)
 
@@ -531,28 +620,34 @@ class CarbonVisualizer:
         ax.grid(True, alpha=0.3)
 
     def _plot_statistics_table(self, ax: plt.Axes, dem: np.ndarray, chm: np.ndarray,
-                              forest_class: np.ndarray, carbon: np.ndarray):
+                              forest_class: np.ndarray, carbon: np.ndarray,
+                              agb: np.ndarray = None):
         """Plot statistics table."""
         stats_text = []
-        stats_text.append(f"{'Metric':<25} {'Value':>15}")
-        stats_text.append("-" * 45)
+        stats_text.append(f"{'Metric':<28} {'Value':>15}")
+        stats_text.append("-" * 48)
 
         # Overall stats
         valid_dem = dem[dem > 0]
         valid_chm = chm[chm > 0]
-        valid_carbon = carbon[carbon > 0]
+        valid_carbon = carbon[carbon > 0] if carbon is not None else np.array([])
+        valid_agb = agb[agb > 0] if agb is not None else np.array([])
 
         if len(valid_dem) > 0:
-            stats_text.append(f"{'Mean Elevation':<25} {np.mean(valid_dem):>12.1f} m")
-            stats_text.append(f"{'Elevation Range':<25} {np.min(valid_dem):>6.0f}-{np.max(valid_dem):>6.0f} m")
+            stats_text.append(f"{'Mean Elevation':<28} {np.mean(valid_dem):>12.1f} m")
+            stats_text.append(f"{'Elevation Range':<28} {np.min(valid_dem):>6.0f}-{np.max(valid_dem):>6.0f} m")
 
         if len(valid_chm) > 0:
-            stats_text.append(f"{'Mean Canopy Height':<25} {np.mean(valid_chm):>12.1f} m")
-            stats_text.append(f"{'Max Canopy Height':<25} {np.max(valid_chm):>12.1f} m")
+            stats_text.append(f"{'Mean Canopy Height':<28} {np.mean(valid_chm):>12.1f} m")
+            stats_text.append(f"{'Max Canopy Height':<28} {np.max(valid_chm):>12.1f} m")
+
+        if len(valid_agb) > 0:
+            stats_text.append(f"{'Mean AGB':<28} {np.mean(valid_agb):>12.1f} Mg/ha")
+            stats_text.append(f"{'Total AGB':<28} {np.sum(valid_agb) * 4 / 10000:>12.1f} Mg")
 
         if len(valid_carbon) > 0:
-            stats_text.append(f"{'Mean Carbon Density':<25} {np.mean(valid_carbon):>12.1f} MgC/ha")
-            stats_text.append(f"{'Total Carbon Stock':<25} {np.sum(valid_carbon) * 4 / 10000:>12.1f} MgC")
+            stats_text.append(f"{'Mean Carbon Density':<28} {np.mean(valid_carbon):>12.1f} MgC/ha")
+            stats_text.append(f"{'Total Carbon Stock':<28} {np.sum(valid_carbon) * 4 / 10000:>12.1f} MgC")
 
         # Per forest type
         stats_text.append("")
@@ -562,10 +657,10 @@ class CarbonVisualizer:
             if np.any(mask):
                 count = np.sum(mask)
                 pct = count / forest_class.size * 100
-                stats_text.append(f"  {FOREST_NAMES[code]:<20} {count:>8} px ({pct:>5.1f}%)")
+                stats_text.append(f"  {FOREST_NAMES[code]:<23} {count:>8} px ({pct:>5.1f}%)")
 
-        ax.text(0.05, 0.95, "\n".join(stats_text), transform=ax.transAxes,
-               fontsize=9, verticalalignment="top", fontfamily="monospace",
+        ax.text(0.02, 0.98, "\n".join(stats_text), transform=ax.transAxes,
+               fontsize=8, verticalalignment="top", fontfamily="monospace",
                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
         ax.axis("off")
         ax.set_title("Patch Statistics", fontsize=11, fontweight="bold")
@@ -859,7 +954,7 @@ class CarbonVisualizer:
 
     def export_slice(
         self,
-        ds: xr.Dataset,
+        data: any,  # Can be xr.Dataset or Dict[str, np.ndarray]
         y_start: int,
         y_end: int,
         x_start: int,
@@ -867,6 +962,12 @@ class CarbonVisualizer:
         filename: str,
     ) -> Path:
         """Export a specific slice (legacy method)."""
+        # Convert dict to xarray if needed
+        if isinstance(data, dict):
+            ds = self._dict_to_xarray(data)
+        else:
+            ds = data
+            
         slice_y = slice(y_start, y_end)
         slice_x = slice(x_start, x_end)
 
@@ -884,6 +985,6 @@ class CarbonVisualizer:
         return self.visualize_single_patch(rgb, dem, chm, forest_class, carbon,
                                           save_path=str(self.output_dir / filename))
 
-    def export_summary(self, ds: xr.Dataset, stats: Dict) -> Path:
+    def export_summary(self, data: any, stats: Dict) -> Path:
         """Export summary visualization (legacy method)."""
-        return self.create_data_analysis_charts(ds, stats)
+        return self.create_data_analysis_charts(data, stats)

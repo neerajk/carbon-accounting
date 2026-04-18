@@ -173,79 +173,150 @@ class CarbonInferenceEngine:
 
     def run_phase_a(
         self,
-        ds: xr.Dataset,
+        geotiff_manager,
         stream_loader,
-    ) -> xr.Dataset:
+    ) -> dict:
         """
         Phase A: Full district pixel-wise processing (ABA method).
 
+        CORRECT FLOW:
+        1. Fetch ESRI + DEM together → keep patches paired
+        2. Run CHMv2 model → Canopy Height Model (CHM)
+        3. Use DEM on CHM output → classify forest type
+        4. Visualize: RGB, DEM, CHM, Forest Class
+        5. Use allometry_params.csv → calculate AGB from CHM + forest_class
+        6. Calculate Carbon = 47% of AGB
+        7. Save all to GeoTIFF + unified visualization
+
         Parameters
         ----------
-        ds : xr.Dataset
-            DataCube dataset
+        geotiff_manager : GeoTIFFManager
+            Manager for GeoTIFF storage
         stream_loader : StreamLoader
             Streaming data loader for tiles
 
         Returns
         -------
-        xr.Dataset
-            Updated dataset with computed variables
+        dict
+            Data dictionary with all layers for visualization (first chunk)
         """
         print("[Phase A] Starting full-district ABA processing...")
         print(f"[Phase A] Region: {self.cfg.get('region', 'unknown')}")
 
-        # Get chunks from stream loader
         chunk_indices = stream_loader.get_chunk_indices()
-
-        # Apply limit if specified
         limit = self.cfg.get("limit")
         if limit:
             chunk_indices = chunk_indices[:limit]
-            print(f"[Phase A] Limit applied: processing first {limit} of {len(stream_loader.get_chunk_indices())} chunks")
+            print(f"[Phase A] Limit applied: processing first {limit} chunks")
 
         print(f"[Phase A] Total chunks to process: {len(chunk_indices)}")
 
-        # Process each chunk
+        # Storage for full arrays
+        all_data = {
+            "red": [],
+            "green": [],
+            "blue": [],
+            "dem": [],
+            "chm": [],
+            "forest_class": [],
+            "agb": [],
+            "carbon_density": [],
+        }
+
+        first_chunk_data = None
+
         for idx, (row, col) in enumerate(tqdm(chunk_indices, desc="Phase A Progress")):
-            # Fetch data
-            rgb_tile, dem_tile, transform = stream_loader.fetch_chunk(row, col)
+            y_start = row * 512
+            x_start = col * 512
+            y_end = min(y_start + 512, geotiff_manager.height_px)
+            x_end = min(x_start + 512, geotiff_manager.width_px)
+
+            # ============================================================
+            # STEP 1: Fetch ESRI + DEM together (keep patches paired)
+            # ============================================================
+            rgb_tile, dem_tile = stream_loader.fetch_chunk(row, col)
 
             if rgb_tile is None or dem_tile is None:
+                print(f"  Skipping chunk ({row}, {col}) - no data")
                 continue
 
-            # Process
-            results = self.process_chunk(rgb_tile, dem_tile)
+            # ============================================================
+            # STEP 2: Run CHMv2 model → Canopy Height
+            # ============================================================
+            self._load_model()
 
-            # --- THE FIX: Check target view shape before assignment to prevent crashing on edge fragments ---
-            target_view = ds["red"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512]
-            
-            # Ensure both the available dataset space and the fetched tile are a perfect 512x512 fit
-            if target_view.shape == (512, 512) and rgb_tile.shape[:2] == (512, 512):
-                ds["red"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 0]
-                ds["green"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 1]
-                ds["blue"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = rgb_tile[:, :, 2]
-                ds["dem"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = dem_tile
-                ds["chm"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["chm"]
-                ds["forest_class"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["forest_class"]
-                ds["carbon_density"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["carbon_density"]
-                ds["agb"][row * 512:(row + 1) * 512, col * 512:(col + 1) * 512] = results["agb"]
-            else:
-                # Option 1: Skip and warn
-                print(f"\n⚠️ Skipping edge fragment at row {row}, col {col} (Target Shape: {target_view.shape}, Tile Shape: {rgb_tile.shape[:2]})")
-                pass
+            class NativePatch:
+                def __init__(self, arr):
+                    self.array = arr
 
-            # Periodic save
-            # Periodic save
+            patch = NativePatch(rgb_tile)
+
+            from pipeline.inference import run_patch_inference
+            predictions, _ = run_patch_inference(
+                [patch], self.model, self.processor, self.device, self.cfg
+            )
+            chm = predictions[0].astype(np.float32)
+
+            # ============================================================
+            # STEP 3: Use DEM on CHM output → classify forest type
+            # ============================================================
+            forest_class = self.dem_classifier.classify(dem_tile)
+
+            # ============================================================
+            # STEP 4: Calculate AGB using allometry_params.csv
+            #         DBH = a × H^b (regional coefficients)
+            #         AGB = 0.0673 × (ρ × DBH² × H)^0.976 (Chave 2014)
+            # ============================================================
+            carbon_results = self.allometry.process_array(chm, forest_class)
+            agb = carbon_results["agb"].astype(np.float32)
+
+            # ============================================================
+            # STEP 5: Calculate Carbon = 47% of AGB
+            # ============================================================
+            carbon_density = carbon_results["carbon_density"].astype(np.float32)
+
+            # ============================================================
+            # STEP 6: Write to GeoTIFF
+            # ============================================================
+            geotiff_manager.write_layer_chunk("chm", chm, y_start, x_start)
+            geotiff_manager.write_layer_chunk("dem", dem_tile.astype(np.float32), y_start, x_start)
+            geotiff_manager.write_layer_chunk("forest_class", forest_class.astype(np.uint8), y_start, x_start)
+            geotiff_manager.write_layer_chunk("agb", agb, y_start, x_start)
+            geotiff_manager.write_layer_chunk("carbon_density", carbon_density, y_start, x_start)
+            geotiff_manager.write_layer_chunk("red", rgb_tile[:, :, 0].astype(np.uint8), y_start, x_start)
+            geotiff_manager.write_layer_chunk("green", rgb_tile[:, :, 1].astype(np.uint8), y_start, x_start)
+            geotiff_manager.write_layer_chunk("blue", rgb_tile[:, :, 2].astype(np.uint8), y_start, x_start)
+
+            # Store for return
+            all_data["red"].append(rgb_tile[:, :, 0].astype(np.uint8))
+            all_data["green"].append(rgb_tile[:, :, 1].astype(np.uint8))
+            all_data["blue"].append(rgb_tile[:, :, 2].astype(np.uint8))
+            all_data["dem"].append(dem_tile.astype(np.float32))
+            all_data["chm"].append(chm)
+            all_data["forest_class"].append(forest_class.astype(np.uint8))
+            all_data["agb"].append(agb)
+            all_data["carbon_density"].append(carbon_density)
+
+            # Capture first complete chunk for visualization
+            if first_chunk_data is None:
+                first_chunk_data = {
+                    "red": rgb_tile[:, :, 0].astype(np.uint8),
+                    "green": rgb_tile[:, :, 1].astype(np.uint8),
+                    "blue": rgb_tile[:, :, 2].astype(np.uint8),
+                    "dem": dem_tile.astype(np.float32),
+                    "chm": chm,
+                    "forest_class": forest_class.astype(np.uint8),
+                    "agb": agb,
+                    "carbon_density": carbon_density,
+                }
+                print(f"\n[Phase A] Captured first chunk (row={row}, col={col}) for visualization")
+
             if (idx + 1) % 10 == 0:
-                ds.to_zarr(self.cfg["output"]["output_dir"], mode="a", consolidated=False)
-                print(f"[Phase A] Saved checkpoint after {idx + 1} chunks")
+                print(f"[Phase A] Processed {idx + 1} chunks")
 
-        # Final save
-        # Final save
-        ds.to_zarr(self.cfg["output"]["output_dir"], mode="a", consolidated=False)
-        print("[Phase A] Complete. Data saved to Zarr store.")
+        print("[Phase A] Complete. Data saved to GeoTIFF files.")
 
-        return ds
+        return first_chunk_data
 
     def run_phase_b(
         self,
