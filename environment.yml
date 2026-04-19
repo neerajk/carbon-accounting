@@ -1,0 +1,30 @@
+name: carbon_tool
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch
+      - torchvision
+
+      - transformers>=4.56.0
+      - huggingface_hub
+      - accelerate
+
+      - rasterio
+      - pyproj
+      - planetary-computer
+      - pystac-client
+      - odc-stac
+
+      - Pillow
+      - numpy<2.0.0
+      - scipy
+      - pandas
+
+      - matplotlib
+      - scikit-learn
+      - tqdm
+      - PyYAML
+      - requests

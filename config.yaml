@@ -1,0 +1,38 @@
+# Carbon Accounting Tool — Configuration
+
+model:
+  hf_model_id: "facebook/dinov3-vitl16-chmv2-dpt-head"
+  device: "mps"        # mps | cpu | cuda
+  dtype: "float32"
+  batch_size: 2
+
+allometry:
+  csv_path: "config/allometry_params.csv"
+  carbon_fraction: 0.47   # IPCC default
+
+altitude_zones:
+  - name: "Sal_Forest"
+    min_alt: 0
+    max_alt: 1000
+    class_code: 1
+  - name: "Chir_Pine"
+    min_alt: 1000
+    max_alt: 1800
+    class_code: 2
+  - name: "Oak_Banj"
+    min_alt: 1800
+    max_alt: 2800
+    class_code: 3
+  - name: "High_Alpine"
+    min_alt: 2800
+    max_alt: 9999
+    class_code: 4
+
+output:
+  out_dir: "data/output"
+  colormap_chm: "viridis"
+  colormap_carbon: "hot_r"
+
+logging:
+  verbose: true
+  progress_bar: true
